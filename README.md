@@ -1,4 +1,4 @@
-# Xeno - Advanced Voice Assistant
+# Xena - Advanced Voice Assistant
 
 An AI-powered desktop voice assistant built with Python, Tkinter, Speech Recognition, Text-to-Speech, System Automation, and Local LLM integration using Ollama.
 
