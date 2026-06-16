@@ -14,7 +14,7 @@ import json
 import subprocess
 import psutil
 import pyautogui
-import screen_brightness_control as sbc
+import screen_brightness_control as sbcpi
 from PIL import Image, ImageTk
 import sys
 import platform
@@ -41,7 +41,7 @@ def _run_bg(cmd_list_or_str, shell=False):
 class AdvancedVoiceAssistant:
     def __init__(self, root):
         self.root = root
-        self.root.title("Advanced Voice Assistant - JARVIS System")
+        self.root.title("Advanced Voice Assistant - Xena System")
         self.root.geometry("1000x700")
         self.root.configure(bg='#0a0a0a')
 
@@ -153,7 +153,7 @@ class AdvancedVoiceAssistant:
 
         tk.Label(
             header_frame,
-            text="JARVIS - Advanced Voice Assistant",
+            text="Xeno - Advanced Voice Assistant",
             font=('Arial', 20, 'bold'),
             fg='#00ffcc', bg='#0a0a0a'
         ).pack(side=tk.LEFT)
@@ -270,7 +270,7 @@ class AdvancedVoiceAssistant:
                                   insertbackground='white', font=('Arial', 11))
         self.llm_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
         self.llm_entry.bind("<Return>", lambda e: self.ask_llm())
-        self.llm_btn = tk.Button(llm_frame, text="Ask Jarvis", command=self.ask_llm,
+        self.llm_btn = tk.Button(llm_frame, text="Ask Xeno", command=self.ask_llm,
                                  bg='#007acc', fg='white', font=('Arial', 10))
         self.llm_btn.pack(side=tk.RIGHT)
 
@@ -509,7 +509,7 @@ class AdvancedVoiceAssistant:
 
         # ── Shutdown assistant ──────────────────────────────────────────────
         elif any(kw in command for kw in ['exit', 'quit', 'goodbye']):
-            response = "Shutting down JARVIS. Goodbye!"
+            response = "Shutting down Xeno. Goodbye!"
             self.add_to_log("Assistant", response)
             self.speak(response)
             self.root.after(1000, self.root.destroy)
@@ -1082,22 +1082,22 @@ class AdvancedVoiceAssistant:
     # ── Brightness ────────────────────────────────────────────────────────────
     def brightness_up(self):
         try:
-            current = sbc.get_brightness()
+            current = sbcpi.get_brightness()
             if isinstance(current, list):
                 current = current[0]
             new = min(100, current + 10)
-            sbc.set_brightness(new)
+            sbcpi.set_brightness(new)
             return f"Brightness increased to {new}%."
         except Exception as e:
             return f"Error: {e}"
 
     def brightness_down(self):
         try:
-            current = sbc.get_brightness()
+            current = sbcpi.get_brightness()
             if isinstance(current, list):
                 current = current[0]
             new = max(0, current - 10)
-            sbc.set_brightness(new)
+            sbcpi.set_brightness(new)
             return f"Brightness decreased to {new}%."
         except Exception as e:
             return f"Error: {e}"
