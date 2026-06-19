@@ -1,3 +1,8 @@
+import token
+import sounddevice as sd
+import tempfile
+import os
+import time
 from email.mime import text
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
@@ -5,7 +10,6 @@ import speech_recognition as sr
 import pyttsx3
 import threading
 import time
-import os
 import re
 import webbrowser
 import datetime
@@ -22,6 +26,9 @@ import ctypes
 import math
 import shutil
 import queue
+import cv2
+from deepface import DeepFace
+import numpy as np
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper – run a shell command in a background thread so the GUI never blocks
@@ -59,32 +66,46 @@ class AdvancedVoiceAssistant:
         else:
             self.engine.setProperty('voice', voices[0].id)   # use the only voice
 
+        self._llm_token_line_started = False
+
         # ── Speech recognition ─────────────────────────────────────────────
         self.recognizer = sr.Recognizer()
         try:
-            self.microphone = sr.Microphone()
-            with self.microphone as source:
-                self.recognizer.adjust_for_ambient_noise(source)
-        except AttributeError:
-                self.microphone = None
-                print("WARNING: PyAudio not found. Voice input disabled.")
+            import sounddevice as sd
+            sd.check_input_settings()
+            self.mic_available = True
+        except Exception:
+            self.mic_available = False
 
         self.is_listening = False
         self.current_app  = None
         self.app_commands = {}
         self.system_status = {}
 
+        # ---- Face / Emotion Recognition ----
+        self.camera = None
+        self.camera_running = False
+        self.known_faces_dir = "known_faces"   # folder with reference images
+        os.makedirs(self.known_faces_dir, exist_ok=True)
+        self.face_recognition_enabled = False  # toggle for live recognition
+
         # ── Offline LLM ─────────────────────────────────────────────────
         self.llm_queue = queue.Queue()
         self.speech_queue = queue.Queue()
         self.speech_worker_running = True
+        threading.Thread(target=self._speech_worker, daemon=True).start()
+        self.engine.startLoop(False)
         self.setup_app_commands()
         self.create_gui()
         self.update_system_status()
+        self.llm_busy = False 
+        self.llm_buffer = []          # accumulates LLM tokens
+        self.llm_current_speaker = None
 
     # =========================================================================
     # APP COMMAND MAP
     # =========================================================================
+
     def setup_app_commands(self):
         self.app_commands = {
             'chrome': {
@@ -146,6 +167,7 @@ class AdvancedVoiceAssistant:
     # =========================================================================
     # GUI
     # =========================================================================
+
     def create_gui(self):
         # ── Header ────────────────────────────────────────────────────────
         header_frame = tk.Frame(self.root, bg='#0a0a0a')
@@ -226,6 +248,8 @@ class AdvancedVoiceAssistant:
             ("Open Terminal",  self.open_terminal),
             ("Calculate",      self._gui_calculate),
         ]
+        tk.Button(commands_frame, text="WhatsApp", command=self.open_whatsapp,
+          font=('Arial', 10), bg='#2a2a2a', fg='white', width=15).pack(pady=2)
 
         for cmd_text, cmd_func in quick_commands:
             tk.Button(
@@ -263,7 +287,9 @@ class AdvancedVoiceAssistant:
         self.monitor_system()
 
         self.conversation_log.tag_configure("bold", font=("Consolas", 10, "bold"))
+
     # ── Local LLM chat bar (uses Ollama server) ─────────────────
+
         llm_frame = tk.Frame(right_panel, bg='#0a0a0a')
         llm_frame.pack(fill=tk.X, pady=(10, 0))
         self.llm_entry = tk.Entry(llm_frame, bg='#2a2a2a', fg='white',
@@ -276,7 +302,34 @@ class AdvancedVoiceAssistant:
 
         self.root.after(50, self._poll_llm_queue)
 
+
+    # ── Webcam panel ────────────────────────────────
+
+        webcam_frame = tk.Frame(right_panel, bg='#1a1a1a', relief=tk.RAISED, bd=1)
+        webcam_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+
+        self.webcam_label = tk.Label(webcam_frame, bg='black')
+        self.webcam_label.pack(pady=5)
+
+        cam_btn_frame = tk.Frame(webcam_frame, bg='#1a1a1a')
+        cam_btn_frame.pack(pady=5)
+
+        self.cam_toggle_btn = tk.Button(
+            cam_btn_frame, text="📷 Start Camera",
+            command=self.toggle_camera,
+            font=('Arial', 10), bg='#007acc', fg='white', width=15
+        )
+        self.cam_toggle_btn.pack(side=tk.LEFT, padx=5)
+
+        self.capture_btn = tk.Button(
+            cam_btn_frame, text="🔍 Analyze Face",
+            command=self.capture_analyze,
+            font=('Arial', 10), bg='#2a2a2a', fg='white', width=15
+        )
+        self.capture_btn.pack(side=tk.LEFT, padx=5)
+
     # ── GUI helper popups for new quick-command buttons ──────────────────────
+
     def _gui_create_folder(self):
         self._simple_input_dialog("Create Folder", "Folder name:", self.create_folder)
 
@@ -314,6 +367,7 @@ class AdvancedVoiceAssistant:
     # =========================================================================
     # VOICE VISUALISATION
     # =========================================================================
+
     def draw_voice_visualization(self, level):
         self.viz_canvas.delete("all")
         width, height = 200, 150
@@ -332,6 +386,7 @@ class AdvancedVoiceAssistant:
     # =========================================================================
     # LISTENING LOOP
     # =========================================================================
+
     def toggle_listening(self):
         if not self.is_listening:
             self.is_listening = True
@@ -348,53 +403,62 @@ class AdvancedVoiceAssistant:
             self.draw_voice_visualization(0)
 
     def listen_loop(self):
-        if not self.microphone:
-                self.add_to_log("System", "Microphone unavailable – install PyAudio to enable voice input.")
-                return
+        if not self.mic_available:
+            self.add_to_log("System", "Microphone unavailable – voice input disabled.")
+            return
+
+        import sounddevice as sd
+        import numpy as np
+
+        sample_rate = 16000   # Works fine with Google
+        self.add_to_log("System", "Listening (Google Speech Recognition)...")
+
         while self.is_listening:
+            if self.llm_busy:
+                time.sleep(0.2)
+                continue
             try:
-                with self.microphone as source:
-                    self.recognizer.adjust_for_ambient_noise(source, duration=0.2)
-                    audio = self.recognizer.listen(source, timeout=1,
-                                                   phrase_time_limit=5)
-                for i in range(5):
-                    if self.is_listening:
-                        self.draw_voice_visualization(i)
-                        time.sleep(0.1)
-                command = self.recognizer.recognize_google(audio).lower()
+                # Record 5 seconds of audio
+                recording = sd.rec(int(5 * sample_rate), samplerate=sample_rate,
+                                channels=1, dtype='int16')
+                sd.wait()
+
+                # Convert to SpeechRecognition AudioData
+                audio_data = sr.AudioData(recording.tobytes(), sample_rate, 2)
+
+                # Use Google's online recognition
+                command = self.recognizer.recognize_google(audio_data).lower()
                 self.add_to_log("You", command)
                 self.process_command(command)
-            except sr.WaitTimeoutError:
-                self.draw_voice_visualization(0)
+
             except sr.UnknownValueError:
-                self.add_to_log("System", "Could not understand audio")
-                self.draw_voice_visualization(0)
+                self.add_to_log("System", "Listening...")
             except sr.RequestError as e:
-                self.add_to_log("System", f"Speech recognition error: {e}")
-                self.draw_voice_visualization(0)
+                self.add_to_log("System", f"Google speech recognition error: {e}")
             except Exception as e:
-                self.add_to_log("System", f"Unexpected error: {e}")
-                self.draw_voice_visualization(0)
+                self.add_to_log("System", f"Listening error: {e}")
 
     # =========================================================================
     # COMMAND ROUTER
     # =========================================================================
+
     def process_command(self, command):
         """Route voice command to the appropriate handler."""
         response = ""
 
         # ── File / Folder management ────────────────────────────────────────
-        if command.startswith('create folder'):
+
+        if 'create folder' in command:
             name = command.replace('create folder', '').strip()
             response = self.create_folder(name) if name else \
                        "Please say the folder name after 'create folder'."
 
-        elif command.startswith('create file'):
+        elif 'create file' in command:
             name = command.replace('create file', '').strip()
             response = self.create_file(name) if name else \
                        "Please say the file name after 'create file'."
 
-        # ── VS Code / Jupyter ───────────────────────────────────────────────
+        # ── VS Code  ───────────────────────────────────────────────
         elif 'open folder' in command and 'vs code' in command:
             path = re.sub(r'open folder|in vs ?code', '', command).strip()
             response = self.open_in_vscode(path, is_folder=True)
@@ -409,13 +473,12 @@ class AdvancedVoiceAssistant:
             response = self.open_in_jupyter(path)
 
         # ── Terminal / run command ──────────────────────────────────────────
-        elif command.startswith('run command'):
+        elif 'run command' in command:
             cmd_text = command.replace('run command', '').strip()
             response = self.run_terminal_command(cmd_text) if cmd_text else \
                        "Please say the command after 'run command'."
 
-        elif any(kw in command for kw in ['open terminal', 'open command prompt',
-                                          'open cmd', 'open powershell']):
+        elif 'open terminal' in command or 'open command prompt' in command or 'open cmd' in command or 'open powershell' in command:
             response = self.open_terminal()
 
         # ── Brave Browser ───────────────────────────────────────────────────
@@ -431,51 +494,62 @@ class AdvancedVoiceAssistant:
         elif 'close brave' in command:
             response = self.close_brave()
 
+        # ── WhatsApp ─────────────────────────────────────────
+
+        elif 'whatsapp' in command:
+            response = self.open_whatsapp()
+
         # ── Math ────────────────────────────────────────────────────────────
-        elif command.startswith('calculate') or \
-             command.startswith('compute') or \
+        
+        elif 'calculate' in command or \
+             'compute' in command or \
              'square root of' in command or \
              re.search(r'\b(sin|cos|tan)\s+of\b', command):
             expr = re.sub(r'^(calculate|compute)', '', command).strip()
             response = self.calculate(expr)
 
         # ── Existing app control ────────────────────────────────────────────
-        elif any(app in command for app in ['chrome', 'browser']):
+
+        elif 'chrome' in command or 'browser' in command:
             response = self.control_application('chrome', command)
+
         elif 'notepad' in command or 'text editor' in command:
             response = self.control_application('notepad', command)
+
         elif 'file explorer' in command or 'files' in command:
             response = self.control_application('file explorer', command)
+
         elif 'vlc' in command or 'media player' in command or 'video' in command:
             response = self.control_application('vlc', command)
 
         # ── System commands ─────────────────────────────────────────────────
-        elif any(kw in command for kw in ['shutdown', 'restart',
-                                           'sleep', 'go to sleep', 'lock']):
+        elif 'shutdown' in command or 'restart' in command or 'sleep' in command or 'go to sleep' in command or 'lock' in command:
             response = self.control_system(command)
 
         # ── Basic app opens ─────────────────────────────────────────────────
+
         elif 'open calculator' in command:
             response = self.open_calculator()
         elif 'open task manager' in command:
             response = self.open_task_manager()
 
         # ── Media control ───────────────────────────────────────────────────
-        elif any(kw in command for kw in ['volume up', 'increase volume']):
+
+        elif 'volume up' in command or 'increase volume' in command:
             response = self.volume_up()
-        elif any(kw in command for kw in ['volume down', 'decrease volume']):
+        elif 'volume down' in command or 'decrease volume' in command:
             response = self.volume_down()
         elif 'mute' in command:
             response = self.volume_mute()
 
         # ── Brightness ──────────────────────────────────────────────────────
-        elif any(kw in command for kw in ['brightness up', 'increase brightness']):
+        elif 'brightness up' in command or 'increase brightness' in command:
             response = self.brightness_up()
-        elif any(kw in command for kw in ['brightness down', 'decrease brightness']):
+        elif 'brightness down' in command or 'decrease brightness' in command:
             response = self.brightness_down()
 
         # ── System info / screenshot ────────────────────────────────────────
-        elif any(kw in command for kw in ['system info', 'system information']):
+        elif 'system info' in command or 'system information' in command:
             response = self.show_system_info()
         elif 'screenshot' in command:
             response = self.take_screenshot()
@@ -487,8 +561,8 @@ class AdvancedVoiceAssistant:
             response = f"Today's date is {datetime.datetime.now().strftime('%A, %B %d, %Y')}"
 
         # ── Web search / navigation ─────────────────────────────────────────
-        elif 'search for' in command:
-            query = command.replace('search for', '').strip()
+        elif 'search online for' in command or 'find for' in command:
+            query = command.replace('search online for', '').replace('find for', '').strip()
             if query:
                 webbrowser.open(f"https://www.google.com/search?q={query}")
                 response = f"Searching for {query}"
@@ -503,20 +577,45 @@ class AdvancedVoiceAssistant:
                 response = f"Opening {site}"
 
         # ── In-app hotkeys ──────────────────────────────────────────────────
-        elif any(kw in command for kw in ['new tab', 'close tab', 'refresh',
-                                           'save', 'copy', 'paste']):
+
+        elif 'new tab' in command or 'close tab' in command or 'refresh' in command or 'save' in command or 'copy' in command or 'paste' in command or 'select all' in command or 'undo' in command or 'find' in command or 'replace' in command:
             response = self.execute_app_command(command)
 
         # ── Shutdown assistant ──────────────────────────────────────────────
-        elif any(kw in command for kw in ['exit', 'quit', 'goodbye']):
+
+        elif 'exit' in command or 'quit' in command or 'goodbye' in command:
             response = "Shutting down Xena. Goodbye!"
             self.add_to_log("Assistant", response)
             self.speak(response)
             self.root.after(1000, self.root.destroy)
             return
+        
+        # ── Face / Emotion commands ─────────────────────
+
+        elif 'start camera' in command or 'turn on camera' in command or 'open camera' in command:
+            self.start_camera()
+            response = "Camera started."
+            
+        elif 'stop camera' in command or 'turn off camera' in command:
+            self.stop_camera()
+            response = "Camera stopped."
+
+        elif 'analyze face' in command or 'what is my emotion' in command:
+            self.capture_analyze()
+            response = "Analyzing your face..."
+
+        elif 'recognize face' in command or 'who am i' in command:
+            self.capture_analyze()   # reuse same logic
+            response = "Checking identity..."
+
+        elif 'toggle face recognition' in command or 'live recognition' in command:
+            response = self.start_face_recognition_mode()
 
         else:
-            response = "I'm not sure how to help with that. Try more specific commands."
+            self.llm_busy = True
+            self.status_var.set("Thinking...")
+            self.ask_llm(command)   # This will log the prompt and reply asynchronously
+            return                
 
         self.add_to_log("Assistant", response)
         self.speak(response)
@@ -524,6 +623,7 @@ class AdvancedVoiceAssistant:
     # =========================================================================
     # NEW FEATURE 1 – File / Folder Management
     # =========================================================================
+
     def create_folder(self, folder_name: str) -> str:
         """Create a new folder in the current working directory."""
         try:
@@ -559,6 +659,7 @@ class AdvancedVoiceAssistant:
     # =========================================================================
     # NEW FEATURE 2 – VS Code & Jupyter Notebook Integration
     # =========================================================================
+
     def _find_vscode(self) -> str | None:
         """Return the VS Code executable path or None."""
         # Common binary names
@@ -627,6 +728,7 @@ class AdvancedVoiceAssistant:
     # =========================================================================
     # NEW FEATURE 3 – Terminal with Custom Command Execution
     # =========================================================================
+
     def open_terminal(self) -> str:
         """Open the system default terminal."""
         try:
@@ -688,6 +790,7 @@ class AdvancedVoiceAssistant:
     # =========================================================================
     # NEW FEATURE 4 – Brave Browser Control
     # =========================================================================
+
     def _brave_exe(self) -> list[str]:
         """Return the Brave browser command for the current OS."""
         system = platform.system()
@@ -760,9 +863,216 @@ class AdvancedVoiceAssistant:
         except Exception as e:
             return f"Error closing Brave: {e}"
 
+
+# ─────────────────────────────────────────────────
+#  Face / Emotion Recognition Methods
+# ─────────────────────────────────────────────────
+
+    def toggle_camera(self):
+        if not self.camera_running:
+            self.start_camera()
+        else:
+            self.stop_camera()
+
+    def start_camera(self):
+        try:
+            self.camera = cv2.VideoCapture(0)  # 0 = default webcam
+            if not self.camera.isOpened():
+                self.add_to_log("System", "Cannot open webcam.")
+                return
+            self.camera_running = True
+            self.cam_toggle_btn.config(text="⏹️ Stop Camera", bg='#cc0000')
+            self.update_webcam()  # start loop
+            self.add_to_log("System", "Webcam started.")
+        except Exception as e:
+            self.add_to_log("System", f"Webcam error: {e}")
+
+    def stop_camera(self):
+        self.camera_running = False
+        if self.camera:
+            self.camera.release()
+            self.camera = None
+        self.webcam_label.config(image='')
+        self.cam_toggle_btn.config(text="📷 Start Camera", bg='#007acc')
+        self.add_to_log("System", "Webcam stopped.")
+
+    def update_webcam(self):
+        """Continuously grab frames and display them (optionally with detection)."""
+        if not self.camera_running or self.camera is None:
+            return
+        ret, frame = self.camera.read()
+        if ret:
+            # If face recognition is enabled, run detection/recognition
+            if self.face_recognition_enabled:
+                frame = self.detect_faces(frame)
+
+            # Convert OpenCV BGR to RGB and then to PIL/Tk
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(rgb)
+            imgtk = ImageTk.PhotoImage(image=img)
+            self.webcam_label.imgtk = imgtk
+            self.webcam_label.configure(image=imgtk)
+        # Schedule next frame (30 fps)
+        self.root.after(30, self.update_webcam)
+
+    def detect_faces(self, frame):
+        """Draw rectangles and labels for faces using OpenCV's DNN or Haar cascade."""
+        # Use a simple Haar cascade for speed (or DNN for better accuracy)
+        cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = cascade.detectMultiScale(gray, 1.3, 5)
+
+        for (x, y, w, h) in faces:
+            cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            # You can optionally run DeepFace on this region (slow) or just label "Unknown"
+        return frame
+    
+    def preprocess_for_emotion(self, frame):
+        """Convert to grayscale and apply CLAHE to boost contrast."""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        enhanced = clahe.apply(gray)
+        # Convert back to BGR for DeepFace (DeepFace expects a BGR image)
+        return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+
+    def capture_analyze(self):
+        if not self.camera or not self.camera_running:
+            self.add_to_log("Assistant", "Please start the camera first.")
+            return
+        self.add_to_log("Assistant", "Capturing emotion burst (2 sec)...")
+        threading.Thread(target=self._analyze_burst, daemon=True).start()
+
+    def _analyze_burst(self):
+        frames = []
+        start = time.time()
+        while time.time() - start < 2.0:
+            ret, frame = self.camera.read()
+            if ret:
+                frames.append(frame.copy())
+            time.sleep(0.1)
+        if not frames:
+            self.add_to_log("Assistant", "No frames captured.")
+            return
+
+        # Aggregate emotion scores
+        emotion_sums = {}
+        identity_votes = {}
+        for f in frames:
+            try:
+                preprocessed = self.preprocess_for_emotion(f)
+                temp = "temp_burst.jpg"
+                cv2.imwrite(temp, preprocessed)
+                res = DeepFace.analyze(temp, actions=['emotion'], enforce_detection=False,
+                                   detector_backend='opencv', silent=True)
+                emotions = res[0]['emotion']
+                for k, v in emotions.items():
+                    emotion_sums[k] = emotion_sums.get(k, 0) + v
+                # Recognition (optional)
+                try:
+                    rec = DeepFace.find(temp, db_path=self.known_faces_dir,
+                                        enforce_detection=False, silent=True)
+                    if rec and not rec[0].empty:
+                        ident = os.path.basename(os.path.dirname(rec[0]['identity'][0]))
+                        identity_votes[ident] = identity_votes.get(ident, 0) + 1
+                except:
+                    pass
+                os.remove(temp)
+            except:
+                continue
+
+        if not emotion_sums:
+            self.add_to_log("Assistant", "Could not analyze frames.")
+            return
+
+        # Average and find top emotion
+        n = len(frames)
+        avg_emotions = {k: v/n for k,v in emotion_sums.items()}
+        sorted_emo = sorted(avg_emotions.items(), key=lambda x: x[1], reverse=True)
+        dominant = sorted_emo[0][0]
+        # If neutral is top but another emotion is within 10% of it, use that other emotion instead
+        if dominant == 'neutral':
+            runner_up = sorted_emo[1][0]
+            if sorted_emo[1][1] > avg_emotions['neutral'] - 5:
+                dominant = runner_up
+                sorted_emo[0] = (runner_up, avg_emotions[runner_up])
+
+        # Identity from majority vote
+        identity = "Unknown"
+        if identity_votes:
+            identity = max(identity_votes, key=identity_votes.get)
+
+        # Detailed response
+        detail = ", ".join(f"{e}: {int(v)}%" for e,v in sorted_emo[:3])
+        response = f"Over 2 seconds, you appear {dominant}. Top emotions: {detail}."
+        if identity != "Unknown":
+            response += f" Recognized as {identity}."
+        self.add_to_log("Assistant", response)
+        self.speak(response)
+
+    def _analyze_frame(self, frame):
+        """Run DeepFace for emotion and recognition, then report."""
+        try:
+            frame = self.preprocess_for_emotion(frame)
+            temp_path = "temp_face.jpg"
+            cv2.imwrite(temp_path, frame)
+
+            # Use retinaface for better alignment (optional)
+            emotion_result = DeepFace.analyze(
+                img_path=temp_path,
+                actions=['emotion'],
+                enforce_detection=False,
+                detector_backend='retinaface',  # better than opencv
+                silent=True
+            )
+            # Save temp image for DeepFace
+            temp_path = "temp_face.jpg"
+            cv2.imwrite(temp_path, frame)
+
+            # Emotion analysis
+            emotion_result = DeepFace.analyze(img_path=temp_path, actions=['emotion'], enforce_detection=False)
+            dominant_emotion = emotion_result[0]['dominant_emotion']
+            emotion_detail = emotion_result[0]['emotion']
+
+            # Face recognition (find identity from known_faces folder)
+            identity = "Unknown"
+            try:
+                recognition_result = DeepFace.find(img_path=temp_path, db_path=self.known_faces_dir,
+                                               enforce_detection=False, silent=True)
+                if recognition_result and not recognition_result[0].empty:
+                    identity = os.path.basename(os.path.dirname(recognition_result[0]['identity'][0]))
+            except Exception:
+                identity = "Unknown"
+
+            # Build response
+            response = f"I see a person who looks {dominant_emotion}."
+            if identity != "Unknown":
+                response += f" Recognized as {identity}."
+            self.add_to_log("Assistant", response)
+            self.speak(response)
+
+            # Clean up
+            os.remove(temp_path)
+        except Exception as e:
+            self.add_to_log("Assistant", f"Face analysis error: {e}")
+
+    def start_face_recognition_mode(self):
+        """Toggle live face recognition overlay."""
+        self.face_recognition_enabled = not self.face_recognition_enabled
+        state = "ON" if self.face_recognition_enabled else "OFF"
+        self.add_to_log("System", f"Live face recognition turned {state}")
+        return f"Live face recognition turned {state}."
+
+    def add_known_face(self, name, image_path):
+        """Copy a reference image into the known_faces folder for future recognition."""
+        target_dir = os.path.join(self.known_faces_dir, name)
+        os.makedirs(target_dir, exist_ok=True)
+        shutil.copy(image_path, os.path.join(target_dir, os.path.basename(image_path)))
+        return f"Added {name} to known faces."
+    
     # =========================================================================
     # NEW FEATURE 5 – Sleep (enhanced / reliable)
     # =========================================================================
+
     def sleep_system(self) -> str:
         """Suspend / sleep the computer – reliable across platforms."""
         try:
@@ -783,10 +1093,62 @@ class AdvancedVoiceAssistant:
         except Exception as e:
             return f"Error putting system to sleep: {e}"
 
+    # =========================================================================        
+    # NEW FEATURE 6 – WhatsApp Control (open desktop or web)
+    # =========================================================================
+
+    def open_whatsapp(self) -> str:
+        """Open WhatsApp desktop app, or fall back to WhatsApp Web."""
+        try:
+            system = platform.system()
+            # Try desktop app first
+            if system == "Windows":
+                # Common paths for WhatsApp on Windows
+                possible_paths = [
+                    os.path.expandvars(r"%LOCALAPPDATA%\WhatsApp\WhatsApp.exe"),
+                    os.path.expandvars(r"%ProgramFiles%\WindowsApps\WhatsApp*.exe"),  # MS Store version
+                    r"C:\Program Files\WhatsApp\WhatsApp.exe",
+                ]
+                for p in possible_paths:
+                    # Handle wildcard for MS Store version
+                    if '*' in p:
+                        import glob
+                        matches = glob.glob(p)
+                        if matches:
+                            subprocess.Popen([matches[0]])
+                            return "Opening WhatsApp (Microsoft Store version)."
+                    elif os.path.isfile(p):
+                        subprocess.Popen([p])
+                        return "Opening WhatsApp desktop app."
+                # Fallback to web
+                webbrowser.open("https://web.whatsapp.com")
+                return "WhatsApp desktop not found. Opening WhatsApp Web."
+
+            elif system == "Darwin":  # macOS
+                apps = ["/Applications/WhatsApp.app", "/Applications/WhatsApp Desktop.app"]
+                for app in apps:
+                    if os.path.exists(app):
+                        subprocess.Popen(["open", app])
+                        return "Opening WhatsApp desktop app."
+                webbrowser.open("https://web.whatsapp.com")
+                return "Opening WhatsApp Web."
+
+            else:  # Linux
+                # Try the command 'whatsapp-desktop' or 'whatsapp'
+                for cmd in ("whatsapp-desktop", "whatsapp"):
+                    if shutil.which(cmd):
+                        subprocess.Popen([cmd])
+                        return f"Opening WhatsApp ({cmd})."
+                webbrowser.open("https://web.whatsapp.com")
+                return "Opening WhatsApp Web."
+
+        except Exception as e:
+            return f"Error opening WhatsApp: {e}"
+
     # =========================================================================
     # NEW FEATURE 6 – Mathematical Calculations (safe eval)
     # =========================================================================
-    # Pre-built safe namespace – only math symbols, no builtins
+
     _MATH_NS = {
         '__builtins__': {},   # block all Python built-ins
         'pi':   math.pi,
@@ -824,6 +1186,7 @@ class AdvancedVoiceAssistant:
             expr = expression.lower().strip()
 
             # ── Natural language → Python ──────────────────────────────────
+
             # Square root
             expr = re.sub(r'square root of\s+', 'sqrt(', expr)
 
@@ -895,6 +1258,7 @@ class AdvancedVoiceAssistant:
     # =========================================================================
     # EXISTING APPLICATION CONTROL (unchanged)
     # =========================================================================
+
     def control_application(self, app_name, command):
         if f"open {app_name}" in command:
             if app_name == 'chrome':
@@ -933,6 +1297,7 @@ class AdvancedVoiceAssistant:
         return "System command not recognised."
 
     # ── App openers ───────────────────────────────────────────────────────────
+
     def open_chrome(self):
         try:
             webbrowser.open("https://www.google.com")
@@ -1020,6 +1385,7 @@ class AdvancedVoiceAssistant:
             return f"Error opening VLC: {e}"
 
     # ── System control ────────────────────────────────────────────────────────
+
     def shutdown_system(self):
         try:
             system = platform.system()
@@ -1058,6 +1424,7 @@ class AdvancedVoiceAssistant:
             return f"Error locking screen: {e}"
 
     # ── Media control ─────────────────────────────────────────────────────────
+
     def volume_up(self):
         try:
             pyautogui.press('volumeup')
@@ -1080,6 +1447,7 @@ class AdvancedVoiceAssistant:
             return f"Error: {e}"
 
     # ── Brightness ────────────────────────────────────────────────────────────
+
     def brightness_up(self):
         try:
             current = sbcpi.get_brightness()
@@ -1103,6 +1471,7 @@ class AdvancedVoiceAssistant:
             return f"Error: {e}"
 
     # ── System info / screenshot ──────────────────────────────────────────────
+
     def show_system_info(self):
         try:
             cpu  = psutil.cpu_percent(interval=1)
@@ -1129,6 +1498,7 @@ class AdvancedVoiceAssistant:
             return f"Error taking screenshot: {e}"
 
     # ── App control panel ─────────────────────────────────────────────────────
+
     def update_app_controls(self):
         self.app_commands_text.config(state=tk.NORMAL)
         self.app_commands_text.delete(1.0, tk.END)
@@ -1146,6 +1516,7 @@ class AdvancedVoiceAssistant:
         self.app_commands_text.config(state=tk.DISABLED)
 
     # ── System monitor ────────────────────────────────────────────────────────
+
     def update_system_status(self):
         try:
             self.cpu_label.config(   text=f"CPU: {psutil.cpu_percent(interval=0.1)}%")
@@ -1159,16 +1530,64 @@ class AdvancedVoiceAssistant:
         self.root.after(2000, self.monitor_system)
 
     # ── TTS & log ─────────────────────────────────────────────────────────────
+
     def speak(self, text: str):
-        def _speak():
-         try:
-            self.engine.say(text)
-            self.engine.runAndWait()
-         except Exception as e:
-            # Show the error immediately in the log
-            self.root.after(0, self.add_to_log, "Error", f"TTS failed: {e}")
-            print(f"[TTS ERROR] {e}")   # also print to terminal
-        threading.Thread(target=_speak, daemon=True).start()
+        """Non‑blocking: enqueue a text to be spoken by the dedicated thread."""
+        if text and hasattr(self, 'speech_queue'):
+            self.speech_queue.put(text)
+
+    def _speech_worker(self):
+        """Dedicated TTS thread – uses pyttsx3 with a started loop."""
+        import time
+        while self.speech_worker_running:
+            try:
+                text = self.speech_queue.get(timeout=1)
+                if not text:
+                    continue
+
+                # Speak the text
+                try:
+                    self.engine.say(text)
+                    # Wait until speaking finishes, but don’t block forever
+                    start = time.time()
+                    while self.engine.isBusy():
+                        self.engine.iterate()
+                        time.sleep(0.01)   # small sleep to avoid 100% CPU
+                        if time.time() - start > 30:   # safety timeout
+                            self.engine.stop()
+                            break
+                except Exception as e:
+                    print(f"[TTS] Error while speaking: {e}")
+                    # Try to reinitialise the engine if something went wrong
+                    self._reinit_engine()
+
+                time.sleep(0.1)
+
+            except queue.Empty:
+                continue
+
+    def _reinit_engine(self):
+        """Recreate the engine and restart the event loop."""
+        try:
+            self.engine = pyttsx3.init()
+            current_rate = self.engine.getProperty('rate')
+            self.engine.setProperty('rate', current_rate - 27)
+            voices = self.engine.getProperty('voices')
+            if len(voices) >= 2:
+                self.engine.setProperty('voice', voices[1].id)
+            elif voices:
+                self.engine.setProperty('voice', voices[0].id)
+            self.engine.startLoop(False)   # restart the loop
+        except Exception as e:
+            print(f"[TTS] Re‑init failed: {e}")
+
+    def _engine_ok(self):
+        """Quick check whether the engine is still responsive."""
+        try:
+            self.engine.getProperty('rate')
+            return True
+        except Exception:
+            return False           
 
     def add_to_log(self, speaker: str, text: str):
         self.conversation_log.config(state=tk.NORMAL)
@@ -1179,6 +1598,7 @@ class AdvancedVoiceAssistant:
 
 
            # ──────────────── Local LLM (Ollama) ────────────────
+
     def ask_llm(self, prompt=None):
         if prompt is None:
             prompt = self.llm_entry.get().strip()
@@ -1192,7 +1612,8 @@ class AdvancedVoiceAssistant:
     def _llm_worker(self, prompt):
         full_response = []
         try:
-            self.llm_queue.put(("start", "Mistral"))
+            start_time = datetime.datetime.now().strftime("%H:%M:%S")
+            self.llm_queue.put(("start", ("Xena", start_time)))
             r = requests.post(
                 "http://localhost:11434/api/chat",
                 json={
@@ -1215,7 +1636,8 @@ class AdvancedVoiceAssistant:
                         self.llm_queue.put(("token", token))
                 except json.JSONDecodeError:
                     continue
-            self.llm_queue.put(("end", None))
+
+                self.llm_queue.put(("end", None))
         except Exception as e:
             self.llm_queue.put(("error", str(e)))
         finally:
@@ -1226,34 +1648,51 @@ class AdvancedVoiceAssistant:
             while True:
                 msg_type, data = self.llm_queue.get_nowait()
                 if msg_type == "start":
+                    speaker, timestamp = data
+                    self.llm_current_speaker = speaker
+                    self.llm_buffer = []
+                    # No flag needed – we just append tokens as they come
+
                     self.conversation_log.config(state=tk.NORMAL)
-                    # Add a blank line before the assistant's response if there is any previous text
                     if self.conversation_log.get("1.0", tk.END).strip():
                         self.conversation_log.insert(tk.END, "\n")
-                    ts = datetime.datetime.now().strftime("%H:%M:%S")
-                    self.conversation_log.insert(tk.END, f"[{ts}] {data}: ", "bold")
-                    self.conversation_log.see(tk.END)
+                    t = datetime.datetime.now().strftime("%H:%M:%S")
+                    self.conversation_log.insert(tk.END, f"[{t}] {speaker}:\n")
                     self.conversation_log.config(state=tk.DISABLED)
+
                 elif msg_type == "token":
+                    self.llm_buffer.append(data)
                     self.conversation_log.config(state=tk.NORMAL)
-                    self.conversation_log.insert(tk.END, data)
+                    self.conversation_log.insert(tk.END, data)   # No extra space
                     self.conversation_log.see(tk.END)
                     self.conversation_log.config(state=tk.DISABLED)
+
                 elif msg_type == "end":
-                    # Ensure the next message starts on a fresh line
-                    self.conversation_log.config(state=tk.NORMAL)
-                    self.conversation_log.insert(tk.END, "\n")
-                    self.conversation_log.see(tk.END)
-                    self.conversation_log.config(state=tk.DISABLED)
+                    pass
+
                 elif msg_type == "error":
                     self.add_to_log("LLM Error", data)
+                    self._reset_llm_state()
+
                 elif msg_type == "done":
-                    self.llm_btn.config(state=tk.NORMAL)
-                    if data:
-                        self.speak(data)
+                    full_response = data
+                    self.conversation_log.config(state=tk.NORMAL)
+                    self.conversation_log.insert(tk.END, "\n")
+                    self.conversation_log.config(state=tk.DISABLED)
+                    self.speak(full_response)
+                    self._reset_llm_state()
+
         except queue.Empty:
             pass
         self.root.after(50, self._poll_llm_queue)
+
+    def _reset_llm_state(self):
+        """Reset LLM busy flag, buffer, and re-enable UI."""
+        self.llm_busy = False
+        self.llm_buffer = []
+        self.llm_current_speaker = None
+        self.llm_btn.config(state=tk.NORMAL)
+        self.status_var.set("Ready")
 
 # ──────────────────────Github Copilot Xena System (https://github.com/rubivssingh281-lab/Xena-AI-Assistant)──────────────
 if __name__ == "__main__":
