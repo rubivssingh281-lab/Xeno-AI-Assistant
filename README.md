@@ -584,7 +584,6 @@ This project is open source. See the source file header for the original reposit
 
 ```
 https://github.com/rubivssingh281-lab/Xena-AI-Assistant
-```
 MIT License
 
 Copyright (c) 2026 Saksham Singh
@@ -610,3 +609,5 @@ SOFTWARE.
 
 Built with Python, powered by Ollama + Mistral, DeepFace, and Google Speech Recognition.
 Author: Saksham Singh
+```
+
